@@ -912,39 +912,98 @@
             }
             function parseSimple3mf(xmlText) {
                 const xml = new DOMParser().parseFromString(xmlText, 'application/xml');
-                const meshes = [...xml.querySelectorAll('object mesh')];
-                if (!meshes.length)
-                    throw Error('3MF-Datei enthält kein Mesh.');
-                const positions = [];
-                const indices = [];
-                let vertexOffset = 0;
-                for (const meshNode of meshes) {
-                    const vertices = [...meshNode.querySelectorAll('vertices vertex')];
-                    for (const vertexNode of vertices) {
-                        positions.push(
-                            Number(vertexNode.getAttribute('x') || 0),
-                            Number(vertexNode.getAttribute('y') || 0),
-                            Number(vertexNode.getAttribute('z') || 0)
-                        );
+                if (xml.querySelector('parsererror')) throw Error('Die 3MF-Modell-XML ist ungültig.');
+                const model = [...xml.getElementsByTagName('*')].find(el => el.localName === 'model');
+                if (!model) throw Error('3MF-Datei enthält kein Modell.');
+                const unitScale = {
+                    micron: 0.001,
+                    millimeter: 1,
+                    centimeter: 10,
+                    inch: 25.4,
+                    foot: 304.8,
+                    meter: 1000
+                }[model.getAttribute('unit') || 'millimeter'] || 1;
+                const resources = [...model.getElementsByTagName('*')].find(el => el.localName === 'resources');
+                if (!resources) throw Error('3MF-Datei enthält keine Ressourcen.');
+                const objects = new Map(
+                    [...resources.getElementsByTagName('*')]
+                        .filter(el => el.localName === 'object' && el.getAttribute('id') !== null)
+                        .map(object => [object.getAttribute('id'), object])
+                );
+                const childElements = (node, name) => [...node.children].filter(child => child.localName === name);
+                const parseTransform = value => {
+                    if (!value) return new THREE.Matrix4();
+                    const values = value.trim().split(/\s+/).map(Number);
+                    if (values.length !== 12 || values.some(v => !Number.isFinite(v))) {
+                        throw Error('3MF-Datei enthält eine ungültige Objekttransformation.');
                     }
-                    const triangles = [...meshNode.querySelectorAll('triangles triangle')];
-                    for (const triangleNode of triangles) {
-                        const v1 = Number(triangleNode.getAttribute('v1'));
-                        const v2 = Number(triangleNode.getAttribute('v2'));
-                        const v3 = Number(triangleNode.getAttribute('v3'));
-                        if (Number.isFinite(v1) && Number.isFinite(v2) && Number.isFinite(v3)) {
-                            indices.push(vertexOffset + v1, vertexOffset + v2, vertexOffset + v3);
+                    const m = new THREE.Matrix4();
+                    m.set(
+                        values[0], values[3], values[6], values[9],
+                        values[1], values[4], values[7], values[10],
+                        values[2], values[5], values[8], values[11],
+                        0, 0, 0, 1
+                    );
+                    return m;
+                };
+                const positions = [];
+                const visitObject = (objectId, parentMatrix, seen = new Set()) => {
+                    if (seen.has(objectId)) throw Error('3MF-Datei enthält eine zyklische Objektverknüpfung.');
+                    const object = objects.get(objectId);
+                    if (!object) throw Error(`3MF-Datei verweist auf ein unbekanntes Objekt (${objectId}).`);
+                    const nextSeen = new Set(seen); nextSeen.add(objectId);
+                    const meshNode = childElements(object, 'mesh')[0];
+                    if (meshNode) {
+                        const verticesNode = childElements(meshNode, 'vertices')[0];
+                        const trianglesNode = childElements(meshNode, 'triangles')[0];
+                        const vertices = verticesNode ? childElements(verticesNode, 'vertex') : [];
+                        const triangles = trianglesNode ? childElements(trianglesNode, 'triangle') : [];
+                        for (const triangle of triangles) {
+                            for (const key of ['v1', 'v2', 'v3']) {
+                                const i = Number(triangle.getAttribute(key));
+                                if (!Number.isInteger(i) || i < 0 || i >= vertices.length) {
+                                    throw Error('3MF-Datei enthält einen ungültigen Dreiecksverweis.');
+                                }
+                                const vertex = vertices[i];
+                                const x = Number(vertex.getAttribute('x'));
+                                const y = Number(vertex.getAttribute('y'));
+                                const z = Number(vertex.getAttribute('z'));
+                                if (![x, y, z].every(Number.isFinite)) throw Error('3MF-Datei enthält ungültige Vertex-Koordinaten.');
+                                const p = new THREE.Vector3(x, y, z).applyMatrix4(parentMatrix);
+                                positions.push(p.x, p.y, p.z);
+                            }
                         }
                     }
-                    vertexOffset = positions.length / 3;
+                    const componentsNode = childElements(object, 'components')[0];
+                    if (componentsNode) {
+                        for (const component of childElements(componentsNode, 'component')) {
+                            const childId = component.getAttribute('objectid');
+                            if (!childId) continue;
+                            const matrix = parentMatrix.clone().multiply(parseTransform(component.getAttribute('transform')));
+                            visitObject(childId, matrix, nextSeen);
+                        }
+                    }
+                };
+                const build = [...model.getElementsByTagName('*')].find(el => el.localName === 'build');
+                const buildItems = build ? childElements(build, 'item') : [];
+                const unitMatrix = new THREE.Matrix4().makeScale(unitScale, unitScale, unitScale);
+                if (buildItems.length) {
+                    for (const item of buildItems) {
+                        const objectId = item.getAttribute('objectid');
+                        if (!objectId) continue;
+                        const matrix = unitMatrix.clone().multiply(parseTransform(item.getAttribute('transform')));
+                        visitObject(objectId, matrix);
+                    }
+                } else {
+                    for (const [id, object] of objects) {
+                        if (childElements(object, 'mesh').length) visitObject(id, unitMatrix);
+                    }
                 }
-                if (!indices.length)
-                    throw Error('3MF-Datei enthält keine Dreiecke.');
-                const g = new THREE.BufferGeometry();
-                g.setIndex(indices);
-                g.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(positions), 3));
-                g.computeVertexNormals();
-                return g;
+                if (!positions.length) throw Error('3MF-Datei enthält kein auflösbares Mesh.');
+                const geometry = new THREE.BufferGeometry();
+                geometry.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(positions), 3));
+                geometry.computeVertexNormals();
+                return geometry;
             }
             function mergeObj(obj) {
                 obj.updateMatrixWorld(true);
