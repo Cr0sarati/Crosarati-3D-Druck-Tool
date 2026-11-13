@@ -723,11 +723,12 @@
             ;
         </script>
         <script type="module">
-            import*as THREE from 'three';
+            import * as THREE from 'three';
             import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
             import {STLLoader} from 'three/addons/loaders/STLLoader.js';
             import {OBJLoader} from 'three/addons/loaders/OBJLoader.js';
             import {ThreeMFLoader} from 'three/addons/loaders/3MFLoader.js';
+            import { unzipSync } from 'https://cdn.jsdelivr.net/npm/fflate@0.8.2/+esm';
             const $ = id => document.getElementById(id)
               , C = [['Schwarz', '#20242b'], ['Weiß', '#f5f5f2'], ['Rot', '#e53935'], ['Blau', '#246bce'], ['Grün', '#219653'], ['Gelb', '#f2c230'], ['Orange', '#ed7d24'], ['Grau', '#8b929c']];
             const M = {
@@ -1005,6 +1006,38 @@
                 geometry.computeVertexNormals();
                 return geometry;
             }
+            async function readZipEntries(file) {
+                const bytes = await file.arrayBuffer();
+                const zipMagic = new Uint8Array(bytes.slice(0, 4));
+                if (zipMagic.length < 4 || zipMagic[0] !== 0x50 || zipMagic[1] !== 0x4b) {
+                    return null;
+                }
+                try {
+                    if (window.JSZip) {
+                        const zip = await JSZip.loadAsync(bytes);
+                        const entries = {};
+                        for (const [name, entry] of Object.entries(zip.files || {})) {
+                            if (!entry || entry.dir)
+                                continue;
+                            entries[name] = await entry.async('uint8array');
+                        }
+                        return entries;
+                    }
+                } catch (error) {
+                    console.warn('JSZip konnte ZIP nicht lesen, verwende ZIP64-Fallback via fflate.', error);
+                }
+                try {
+                    const entries = unzipSync(new Uint8Array(bytes));
+                    const mapped = {};
+                    for (const [name, value] of Object.entries(entries || {})) {
+                        mapped[name] = value instanceof Uint8Array ? value : new Uint8Array(value);
+                    }
+                    return mapped;
+                } catch (error) {
+                    console.warn('fflate konnte ZIP nicht lesen.', error);
+                    return null;
+                }
+            }
             function mergeObj(obj) {
                 obj.updateMatrixWorld(true);
                 const p = [];
@@ -1068,15 +1101,17 @@
                 if (n.endsWith('.obj'))
                     return mergeObj(new OBJLoader().parse(await file.text()));
                 if (n.endsWith('.3mf')) {
-                    try {
-                        const zip = await JSZip.loadAsync(await file.arrayBuffer());
-                        const modelPath = Object.keys(zip.files).find(p => /\.model$/i.test(p) && !p.startsWith('_rels/') && !p.includes('/_rels/'));
-                        if (modelPath && zip.file(modelPath)) {
-                            const xmlText = await zip.file(modelPath).async('text');
-                            return parseSimple3mf(xmlText);
+                    const zipEntries = await readZipEntries(file);
+                    if (zipEntries) {
+                        const modelPath = Object.keys(zipEntries).find(p => /(?:^|\/)[^\/]*\.model$/i.test(p) || /(?:^|\/)[^\/]*\.xml$/i.test(p) && !p.startsWith('_rels/') && !p.includes('/_rels/'));
+                        if (modelPath) {
+                            const xmlText = new TextDecoder('utf-8').decode(zipEntries[modelPath]);
+                            try {
+                                return parseSimple3mf(xmlText);
+                            } catch (e) {
+                                console.warn('parseSimple3mf fehlgeschlagen; versuche ThreeMFLoader:', e);
+                            }
                         }
-                    } catch (e) {
-                        console.warn('3MF-Fallback parse failed, trying ThreeMFLoader', e);
                     }
                     try {
                         const parsed = new ThreeMFLoader().parse(await file.arrayBuffer());
@@ -1088,19 +1123,24 @@
                     throw Error('3MF-Datei konnte nicht verarbeitet werden.');
                 }
                 if (n.endsWith('.zip')) {
-                    if (!window.JSZip)
+                    if (!window.JSZip && typeof unzipSync !== 'function')
                         throw Error('ZIP-Bibliothek nicht verfügbar.');
-                    const z = await JSZip.loadAsync(await file.arrayBuffer())
-                      , paths = Object.keys(z.files).filter(p => /\.(stl|obj|3mf)$/i.test(p)).sort();
-                    if (!paths.length)
-                        throw Error('ZIP enthält keine STL-, OBJ- oder 3MF-Datei.');
-                    const f = z.file(paths[0])
-                      , p = paths[0].toLowerCase();
-                    if (p.endsWith('.stl'))
-                        return new STLLoader().parse(await f.async('arraybuffer'));
-                    if (p.endsWith('.obj'))
-                        return mergeObj(new OBJLoader().parse(await f.async('text')));
-                    return parse(new File([await f.async('blob')],paths[0]))
+                    const zipEntries = await readZipEntries(file);
+                    if (zipEntries) {
+                        const entries = Object.keys(zipEntries).filter(p => /\.(stl|obj|3mf)$/i.test(p)).sort();
+                        if (entries.length) {
+                            const first = entries[0];
+                            const data = zipEntries[first];
+                            const blob = new Blob([data], {type: 'application/octet-stream'});
+                            const p = first.toLowerCase();
+                            if (p.endsWith('.stl'))
+                                return new STLLoader().parse(await blob.arrayBuffer());
+                            if (p.endsWith('.obj'))
+                                return mergeObj(new OBJLoader().parse(new TextDecoder().decode(data)));
+                            return parse(new File([blob], first));
+                        }
+                    }
+                    throw Error('ZIP enthält keine STL-, OBJ- oder 3MF-Datei.');
                 }
                 throw Error('Format nicht unterstützt. Wähle STL, OBJ, 3MF oder ZIP.')
             }
